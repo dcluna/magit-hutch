@@ -110,6 +110,7 @@ into TOKEN-BOX."
          (is-abort          (eq response 'abort))
          (is-nil-resp       (null response))
          (is-str-resp       (stringp response))
+         (is-stream-end     (eq response t))
          (evt-resp          (and (consp response) (car response)))
          (is-tool-resp      (eq evt-resp 'tool-result))
          (is-reasoning-resp (eq evt-resp 'reasoning)))
@@ -120,7 +121,14 @@ into TOKEN-BOX."
                             (t response)))
     (cond
      (is-abort nil) ;; was aborted in the FSM or cancelled externally
-     (is-nil-resp (funcall on-error 'llm-error (plist-get info :status))) ;; no response
+     ;; no response; :error carries the detail (curl exit code, API message)
+     (is-nil-resp
+      (let ((err (plist-get info :error)))
+        (funcall on-error 'llm-error
+                 (if err
+                     (format "%s: %s" (plist-get info :status)
+                             (if (consp err) (or (plist-get err :message) err) err))
+                   (plist-get info :status)))))
 
      ;; gptel auto-executed tools; check result and track rounds
      (is-tool-resp
@@ -150,6 +158,16 @@ into TOKEN-BOX."
      (is-reasoning-resp
       (when (equal (plist-get info :status) "max_tokens")
         (funcall on-error 'max-tokens "stopped mid-thinking: max_tokens exhausted")))
+
+     ;; streaming: text arrives in chunks before any tool call is parsed,
+     ;; so judge the turn only at end-of-stream (t)
+     ((and is-str-resp (plist-get info :stream)) nil)
+
+     ;; end of a streamed turn: pending tools mean wait for the tool result
+     (is-stream-end
+      (unless (or (hutch--result-box-get result-box)
+                  (plist-get info :tool-use))
+        (funcall on-error 'no-submit "model finished without calling submit_review")))
 
      ;; an empty response is considered model giving up
      ((and is-str-resp
@@ -184,6 +202,8 @@ Accumulates token usage in TOKEN-BOX.  Bounded by MAX-ROUNDS."
   (thread-last
     (gptel-request (plist-get prompt :user)
       :system (plist-get prompt :system)
+      ;; ignored by backends that can't stream; required by some (ChatGPT OAuth)
+      :stream t
       :callback (lambda (response info)
                   (hutch--agent-request response
                                         info
